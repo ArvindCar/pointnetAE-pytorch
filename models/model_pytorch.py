@@ -19,7 +19,7 @@ class Conv2d(nn.Module):
         self.bn = nn.BatchNorm2d(out_channels) if bn else None
         
     def forward(self, x):
-        x = self.conv(x)
+        x = self.conv(x).contiguous()
         if self.bn is not None:
             x = self.bn(x)
         return F.relu(x)

@@ -10,6 +10,7 @@ import sys
 import wandb
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+import importlib
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +20,6 @@ sys.path.append(os.path.join(ROOT_DIR, 'models'))
 sys.path.append(os.path.join(ROOT_DIR, 'utils'))
 
 # Import your modules
-from models.model_pytorch import PointNetAE, get_loss
 from ShapeNetMeshDataLoader import get_dataloader
 
 # Command line arguments
@@ -66,6 +66,11 @@ LOG_FOUT.write(str(FLAGS)+'\n')
 
 HOSTNAME = socket.gethostname()
 
+# import the model dynamically based on the command line argument
+model_module = importlib.import_module(f'models.{FLAGS.model}')
+PointNetAE = model_module.PointNetAE
+get_loss = model_module.get_loss
+
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -80,7 +85,7 @@ def init_wandb(model=None):
         dir=LOG_DIR
     )
     # Log model architecture as a graph
-    wandb.watch(model)
+    # wandb.watch(model)
 
 def log_string(out_str):
     if not is_main_process():
@@ -98,9 +103,12 @@ def adjust_learning_rate(optimizer, batch_idx):
     return lr
 
 def train():
+    
     # Set device
     if torch.cuda.is_available():
         local_rank = int(os.environ['LOCAL_RANK'])
+        print("Available GPUs:", torch.cuda.device_count())
+        print("local_rank:", local_rank)
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend='nccl')
         device = torch.device(f"cuda:{local_rank}")
@@ -115,7 +123,6 @@ def train():
     
     # Create model and optimizer
     model = PointNetAE(num_point=NUM_POINT).to(device)
-    model = DDP(model, device_ids=[local_rank])
 
     
     if OPTIMIZER == 'adam':
@@ -171,7 +178,34 @@ def train():
     log_string(f"Train dataset size: {len(train_loader.dataset)}")
     log_string(f"Validation dataset size: {len(val_loader.dataset)}")
     log_string(f"Test dataset size: {len(test_loader.dataset)}")
+    # Variables for resuming training
+    global_step = 0
+    best_loss = 1e20
+    start_epoch = 0
+    
+    # Resume from checkpoint if specified
+    if FLAGS.resume:
+        if os.path.isfile(FLAGS.resume):
+            log_string(f"Loading checkpoint from {FLAGS.resume}")
+            checkpoint = torch.load(FLAGS.resume, map_location=device)
+            
+            # Load model state
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Load optimizer state
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Restore training state
+            start_epoch = checkpoint.get('epoch', 0) + 1  # Start from next epoch
+            best_loss = checkpoint.get('best_loss', 1e20)
+            global_step = checkpoint.get('global_step', 0)
+            
+            log_string(f"Resuming training from epoch {start_epoch}")
+            log_string(f"Loaded checkpoint with best validation loss: {best_loss}")
+        else:
+            log_string(f"No checkpoint found at {FLAGS.resume}")
 
+    model = DDP(model, device_ids=[local_rank])
     # Initialize wandb
     init_wandb(model)
     
@@ -256,8 +290,8 @@ def train():
         
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
-            save_path = os.path.join(LOG_DIR, "model.pth")
-            # Handle the case where model is wrapped with DataParallel
+            save_path = os.path.join(LOG_DIR, f"checkpoint_epoch_{epoch:03d}.pth")
+            # Handle the case where model is wrapped with DataParallel or DDP
             model_to_save = model.module if hasattr(model, 'module') else model
             torch.save({
                 'epoch': epoch,
@@ -265,6 +299,8 @@ def train():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_loss': best_loss,
                 'global_step': global_step,
+                'seed': FLAGS.seed,
+                'lr': BASE_LEARNING_RATE
             }, save_path)
             log_string(f"Checkpoint saved to {save_path}")
             
